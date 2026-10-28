@@ -2836,7 +2836,7 @@ async def ui_view_spend_logs(
         sql_conditions: Final[list[str]] = []
         sql_params: Final[list[object]] = []
         p = 1  # parameter index counter
-        window_literal_conditions: list[str] = []
+        window_literal_conditions: Final[list[str]] = []  # mutable-ok: filled once below from the time-window helper
 
         # Date range. Wrap the param side with `AT TIME ZONE 'UTC'` so comparison
         # against the plain `timestamp` column does not depend on the DB session
@@ -3108,6 +3108,8 @@ class _SessionScanRow(TypedDict):
 
 # Each attempt reads this many times the first read's rows, ``None`` reading them all; an attempt is exact or discarded.
 _SESSION_SCAN_GROWTH: Final[tuple[int | None, ...]] = (1, 8, 64, None)
+# Carried sessions' keys, api keys and last activity, plus the oldest row of the read that carried them.
+_CarryParams: TypeAlias = tuple[Sequence[str], Sequence[str], Sequence[str], str] | tuple[()]
 
 
 def _read_falls_short(scan_rows: int | None, session_count: int, rows_read: int, sessions_needed: int) -> bool:
@@ -3261,11 +3263,11 @@ async def _ui_session_grouped_spend_logs(
     # An offset page's read that holds no session of the page hands its sessions to the next read, which then reads
     # only the rows at or before that read's oldest row instead of reading the newest rows again.
     carry_index: Final = limit_index + 1 + len(offset_params)
-    carried: Sequence[_SessionScanRow] = ()
-    carry_params: tuple[list[str], list[str], list[str], str] | tuple[()] = ()
-    found: Sequence[_SessionScanRow] = ()
-    session_count = 0
-    rows_read = 0
+    carried: Sequence[_SessionScanRow] = ()  # rebind-ok: each read replaces the sessions carried to the next read
+    carry_params: _CarryParams = ()  # rebind-ok: each read replaces the carried sessions' query params
+    found: Sequence[_SessionScanRow] = ()  # rebind-ok: each read replaces the sessions found so far
+    session_count = 0  # rebind-ok: each read replaces the total session count
+    rows_read = 0  # rebind-ok: each read replaces the rows-read tally
     for growth in _SESSION_SCAN_GROWTH if sort_desc else (None,):
         scan_rows: int | None = None if growth is None else first_read * growth
         # Skip a read that the last read's rows per session say still holds too few sessions to decide anything.
