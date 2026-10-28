@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from itertools import accumulate, chain, repeat, takewhile
+from itertools import accumulate, chain, product, repeat, takewhile
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar, cast, get_type_hints
 
@@ -1140,6 +1140,79 @@ def convert_vertex_datetime_to_openai_datetime(vertex_datetime: str) -> int:
 _convert_vertex_datetime_to_openai_datetime = convert_vertex_datetime_to_openai_datetime
 
 
+def _const_json_type(value: JsonValue) -> str | None:
+    match value:
+        case bool():
+            return "boolean"
+        case int():
+            return "integer"
+        case float():
+            return "number"
+        case str():
+            return "string"
+        case _:
+            return None
+
+
+def _enum_from_const(node: JsonValue) -> Mapping[str, JsonValue]:
+    if not isinstance(node, dict) or "enum" in node:
+        return {}
+    json_type: Final = _const_json_type(node.get("const"))
+    if json_type is None:
+        return {}
+    return {"enum": [node["const"]], **({} if "type" in node else {"type": json_type})}
+
+
+def _declared_types(branch: Mapping[str, JsonValue]) -> frozenset[str] | None:
+    match branch.get("type"):
+        case str() as declared:
+            return frozenset((declared,))
+        case list() as declared:
+            return frozenset(item for item in declared if isinstance(item, str))
+        case _:
+            return None
+
+
+def _json_object(value: JsonValue) -> Mapping[str, JsonValue]:
+    return value if isinstance(value, dict) else {}
+
+
+def _json_strings(value: JsonValue) -> tuple[str, ...]:
+    return tuple(item for item in value if isinstance(item, str)) if isinstance(value, list) else ()
+
+
+def _merged_object_keywords(
+    type_branch: Mapping[str, JsonValue], branch: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    properties: Final = {**_json_object(type_branch.get("properties")), **_json_object(branch.get("properties"))}
+    required: Final = tuple(
+        dict.fromkeys((*_json_strings(type_branch.get("required")), *_json_strings(branch.get("required"))))
+    )
+    return {**({"properties": properties} if properties else {}), **({"required": [*required]} if required else {})}
+
+
+def _crossed_branch(
+    type_branch: Mapping[str, JsonValue], branch: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue] | None:
+    expansion_type: Final = type_branch.get("type")
+    declared: Final = _declared_types(branch)
+    if declared is not None and expansion_type not in declared:
+        return None
+    return deepcopy({**type_branch, **branch, "type": expansion_type, **_merged_object_keywords(type_branch, branch)})
+
+
+def _crossed_any_of(
+    type_branches: Sequence[Mapping[str, JsonValue]], node: JsonValue
+) -> tuple[Mapping[str, JsonValue], ...]:
+    existing: Final = node.get("anyOf") if isinstance(node, dict) else None
+    if not isinstance(existing, list):
+        return ()
+    pairs: Final = product(type_branches, (branch for branch in existing if isinstance(branch, dict)))
+    return tuple(
+        merged for type_branch, branch in pairs if (merged := _crossed_branch(type_branch, branch)) is not None
+    )
+
+
 def _convert_schema_types(schema, depth=0):
     """
     Convert type arrays and lowercase types for Vertex AI compatibility.
@@ -1154,6 +1227,9 @@ def _convert_schema_types(schema, depth=0):
 
     if not isinstance(schema, dict):
         return
+
+    for key, value in _enum_from_const(cast(JsonValue, schema)).items():  # cast-ok: an untyped JSON schema node
+        schema[key] = value  # rebind-ok: this function edits the schema in place by design
 
     # Handle type field
     if "type" in schema:
@@ -1172,7 +1248,7 @@ def _convert_schema_types(schema, depth=0):
                 "maxProperties",
             }
 
-            any_of: Final[list[dict[str, object]]] = []
+            any_of: Final[list[dict[str, JsonValue]]] = []
             for t in type_val:
                 if not isinstance(t, str):
                     continue
@@ -1183,7 +1259,7 @@ def _convert_schema_types(schema, depth=0):
 
                 # For object/array types, include type-specific fields
                 if t in ("object", "array"):
-                    item_schema: dict[str, object] = {"type": t}
+                    item_schema: dict[str, JsonValue] = {"type": t}
                     # Move type-specific fields into this anyOf item
                     for field in type_specific_fields:
                         if field in schema:
@@ -1195,7 +1271,7 @@ def _convert_schema_types(schema, depth=0):
                             "type": t,
                             "enum": [
                                 value
-                                for value in cast(list[object], schema["enum"])  # cast-ok: an untyped JSON list
+                                for value in cast(list[JsonValue], schema["enum"])  # cast-ok: an untyped JSON list
                                 if value is not None
                             ],
                         }
@@ -1210,7 +1286,15 @@ def _convert_schema_types(schema, depth=0):
                 for field in type_specific_fields:
                     schema.pop(field, None)
 
-            schema["anyOf"] = any_of
+            schema["anyOf"] = (
+                list(
+                    _crossed_any_of(
+                        any_of,
+                        cast(JsonValue, schema),  # cast-ok: an untyped JSON schema node
+                    )
+                )
+                or any_of
+            )
             schema.pop("type")
         elif isinstance(type_val, list) and len(type_val) == 1:
             schema["type"] = type_val[0]

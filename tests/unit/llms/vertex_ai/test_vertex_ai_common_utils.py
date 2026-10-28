@@ -1592,6 +1592,126 @@ def test_build_vertex_schema_keeps_integer_enum_on_nullable_type_list(
     assert schema["properties"]["level"] == expected_level
 
 
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        pytest.param(
+            {
+                "type": ["object", "null"],
+                "anyOf": [{"properties": {"name": {"const": "People"}}}, {"properties": {"name": {"const": "Email"}}}],
+                "required": ["name"],
+            },
+            {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string", "enum": ["People"]}},
+                        "nullable": True,
+                    },
+                    {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string", "enum": ["Email"]}},
+                        "nullable": True,
+                    },
+                ]
+            },
+            id="nullable-object-with-const-branches",
+        ),
+        pytest.param(
+            {
+                "type": ["object", "null"],
+                "properties": {"query": {"type": "string"}, "kind": {"type": "string"}},
+                "required": ["query"],
+                "anyOf": [
+                    {"properties": {"kind": {"const": "person"}, "email": {"type": "string"}}, "required": ["email", "query"]},
+                    {"type": "object", "properties": {"site": {"type": "string"}}, "required": ["site"]},
+                ],
+            },
+            {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["person"]},
+                            "email": {"type": "string"},
+                        },
+                        "required": ["query", "email"],
+                        "nullable": True,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}, "kind": {"type": "string"}, "site": {"type": "string"}},
+                        "required": ["query", "site"],
+                        "nullable": True,
+                    },
+                ]
+            },
+            id="branch-properties-and-required-merge-with-the-parent",
+        ),
+        pytest.param(
+            {
+                "type": ["string", "object"],
+                "anyOf": [{"type": "string", "maxLength": "5"}, {"type": "object", "properties": {"id": {"type": "string"}}}],
+            },
+            {"anyOf": [{"type": "string", "maxLength": "5"}, {"type": "object", "properties": {"id": {"type": "string"}}}]},
+            id="typed-branches-keep-only-their-own-type",
+        ),
+        pytest.param(
+            {"type": ["string", "integer"], "anyOf": [{"type": ["integer", "null"], "minimum": 1}, {"pattern": "^a"}]},
+            {
+                "anyOf": [
+                    {"type": "string", "pattern": "^a"},
+                    {"type": "integer", "minimum": 1},
+                    {"type": "integer", "pattern": "^a"},
+                ]
+            },
+            id="type-list-branch-matches-each-listed-type",
+        ),
+        pytest.param(
+            {"type": ["string", "null"], "anyOf": [{"type": "integer"}]},
+            {"anyOf": [{"type": "string", "nullable": True}]},
+            id="no-compatible-branch-keeps-the-type-list",
+        ),
+        pytest.param(
+            {"type": ["string", "null"], "anyOf": [True]},
+            {"anyOf": [{"type": "string", "nullable": True}]},
+            id="boolean-branches-keep-the-type-list",
+        ),
+    ],
+)
+def test_build_vertex_schema_intersects_a_type_list_with_its_existing_anyof(
+    field: JsonValue, expected: JsonValue
+) -> None:
+    schema: Final = build_vertex_schema({"type": "object", "properties": {"field": field}})
+
+    assert schema["properties"]["field"] == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "send_integer_enums", "expected"),
+    [
+        ({"const": "x"}, False, {"type": "string", "enum": ["x"]}),
+        ({"const": True}, False, {"type": "boolean"}),
+        ({"const": 3}, False, {"type": "integer"}),
+        ({"const": 3}, True, {"type": "integer", "enum": ["3"]}),
+        ({"const": 1.5}, False, {"type": "number"}),
+        ({"type": "number", "const": 2}, False, {"type": "number"}),
+    ],
+    ids=["string", "boolean", "integer", "integer-enum-sent", "number", "declared-type-kept"],
+)
+def test_build_vertex_schema_sends_const_as_a_single_value_enum(
+    field: JsonValue, send_integer_enums: bool, expected: JsonValue
+) -> None:
+    schema: Final = build_vertex_schema(
+        {"type": "object", "properties": {"field": field}}, send_integer_enums=send_integer_enums
+    )
+
+    assert schema["properties"]["field"] == expected
+
+
 def test_map_function_keeps_integer_enum_when_tools_are_reused():
     from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
 
