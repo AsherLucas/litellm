@@ -4375,6 +4375,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-redis-store"
+version = "0.1.0"
+dependencies = [
+ "litellm-redis-client",
+ "litellm-redis-testing",
+ "rstest",
+ "tokio",
+]
+
+[[package]]
 name = "litellm-redis-testing"
 version = "0.1.0"
 dependencies = [
