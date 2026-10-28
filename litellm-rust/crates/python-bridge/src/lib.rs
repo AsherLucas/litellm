@@ -10,6 +10,7 @@ mod logger;
 mod marshal;
 mod preflight;
 mod python_settings;
+mod redis;
 mod routes;
 mod secrets;
 mod tokenizer;
@@ -29,6 +30,8 @@ mod _native {
     use crate::errors::{RustBridgeDeclined, RustUpstreamError};
     #[pymodule_export]
     use crate::logger::NativeDiagnosticProcessor;
+    #[pymodule_export]
+    use crate::redis::{NativeRedisClient, NativeRedisFailure};
     #[pymodule_export]
     use crate::routes::audio_transcription::{atranscription, transcription};
     #[pymodule_export]
