@@ -2836,6 +2836,7 @@ async def ui_view_spend_logs(
         sql_conditions: Final[list[str]] = []
         sql_params: Final[list[object]] = []
         p = 1  # parameter index counter
+        window_literal_conditions: list[str] = []
 
         # Date range. Wrap the param side with `AT TIME ZONE 'UTC'` so comparison
         # against the plain `timestamp` column does not depend on the DB session
@@ -2847,6 +2848,10 @@ async def ui_view_spend_logs(
             sql_conditions.append(f"\"startTime\" <= (${p}::timestamptz AT TIME ZONE 'UTC')")
             sql_params.append(end_date_obj)
             p += 1
+            window_literal_conditions.extend(
+                f'"startTime" {op} {_utc_timestamp_literal(bound)}'
+                for op, bound in ((">=", start_date_obj), ("<=", end_date_obj))
+            )
 
         if search is not None and start_date_obj is not None and end_date_obj is not None:
             search_condition: Final = _build_spend_log_search_condition(
@@ -2946,7 +2951,13 @@ async def ui_view_spend_logs(
             p += 1
 
         if status_filter is not None and group_by_session is True and not is_search_lookup:
-            session_filter_conditions: Final = " AND ".join(sql_conditions) or "TRUE"
+            # The window goes in as literals (parse_date's UTC datetimes, checked by
+            # _utc_timestamp_literal). Prisma reuses its prepared statements, and from the 6th
+            # run Postgres plans a $N window as 0.5% of the table, then probes every
+            # session by api_key: ~2 min instead of ~2.5 s over 700k rows.
+            session_filter_conditions: Final = (
+                " AND ".join([*window_literal_conditions, *sql_conditions[len(window_literal_conditions) :]]) or "TRUE"
+            )
             sql_conditions.append(
                 f"""({_SESSION_GROUP_KEY_SQL}) IN (
                     SELECT session_key, api_key FROM (
@@ -2978,6 +2989,7 @@ async def ui_view_spend_logs(
                 page_size=page_size,
                 sort_desc=order_direction != "asc",
                 session_cursor=session_cursor,
+                status_filtered=status_filter is not None and not is_search_lookup,
             )
 
         # Build the ORDER BY expression. ttft_ms is computed from
@@ -3083,6 +3095,45 @@ class _SessionPageRow(TypedDict):
     last_activity: ReadOnly[str]
 
 
+class _SessionScanRow(TypedDict):
+    session_key: ReadOnly[str | None]
+    api_key: ReadOnly[str | None]
+    last_activity: ReadOnly[str | None]
+    settled: ReadOnly[bool | None]
+    rows_scanned: ReadOnly[int]
+    session_count: ReadOnly[int]
+    oldest: ReadOnly[str | None]
+    carried: ReadOnly[bool | None]
+
+
+# Each attempt reads this many times the first read's rows, ``None`` reading them all; an attempt is exact or discarded.
+_SESSION_SCAN_GROWTH: Final[tuple[int | None, ...]] = (1, 8, 64, None)
+
+
+def _read_falls_short(scan_rows: int | None, session_count: int, rows_read: int, sessions_needed: int) -> bool:
+    """Whether ``scan_rows`` newest rows, as dense as the ``rows_read`` that held ``session_count`` sessions, hold too few."""
+    return scan_rows is not None and scan_rows * session_count < sessions_needed * rows_read
+
+
+def _utc_timestamp_literal(bound: datetime) -> str:
+    """SQL literal for a UTC datetime; anything else is refused, so no caller text reaches the SQL."""
+    text: Final = bound.isoformat() if type(bound) is datetime and bound.tzinfo is timezone.utc else ""
+    if not text or not set(text) <= set("0123456789-:.T+"):
+        raise TypeError(f"expected a UTC datetime, got {type(bound).__name__}")
+    return f"('{text}'::timestamptz AT TIME ZONE 'UTC')"
+
+
+def _newest_session_rows_sql(where_clause: str, scan_rows: int | None, not_after: str | None) -> str:
+    """The newest ``scan_rows`` matching rows (all of them for ``None``), none newer than ``not_after``."""
+    return f"""
+        SELECT {_SESSION_KEY_EXPR} AS session_key, api_key, "startTime"
+        FROM "LiteLLM_SpendLogs"
+        WHERE {where_clause}
+        {f'AND "startTime" <= {not_after}' if not_after is not None else ""}
+        {f'ORDER BY "startTime" DESC LIMIT {scan_rows}' if scan_rows is not None else ""}
+    """
+
+
 def _parse_session_cursor(session_cursor: str | None) -> tuple[str, str, str] | None:
     if session_cursor is None or session_cursor.count("|") < 2:
         return None
@@ -3099,19 +3150,26 @@ async def _fetch_session_representatives(
     sql_params: Sequence[object],
     next_param_index: int,
     session_keys: Sequence[tuple[str, str]],
+    status_filter: object | None = None,
 ) -> list[dict[str, object]]:  # mutable-ok: _build_ui_spend_logs_response writes session counts onto each row
-    """Fetch the final agent outcome, or newest non-MCP row, of each ``(session_key, api_key)`` session, in ``session_keys`` order."""
+    """Fetch the final agent outcome, or newest non-MCP row, of each ``(session_key, api_key)`` session, in ``session_keys`` order.
+
+    With ``status_filter``, a session whose outcome no longer has that status is dropped, as the session status
+    filter would drop it in this statement's snapshot.
+    """
     rep_query: Final = f"""
         SELECT * FROM (
             SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
                 {_SPEND_LOG_LIST_COLUMNS}
             FROM "LiteLLM_SpendLogs"
             WHERE {where_clause}
+              AND (session_id = ANY(${next_param_index}::text[]) OR request_id = ANY(${next_param_index}::text[]))
               AND ({_SESSION_GROUP_KEY_SQL}) IN (
                   SELECT * FROM unnest(${next_param_index}::text[], ${next_param_index + 1}::text[])
               )
             ORDER BY {_SESSION_GROUP_KEY_SQL}, {_SESSION_REPRESENTATIVE_ORDER_SQL}
         ) AS session_representatives
+        {f"WHERE COALESCE(status, 'success') = ${next_param_index + 2}" if status_filter is not None else ""}
     """
     rep_rows: Final[Sequence[dict[str, object]]] = await _query_raw(  # mutable-ok: rows are enriched in place
         prisma_client,
@@ -3119,37 +3177,12 @@ async def _fetch_session_representatives(
         *sql_params,
         [session_key for session_key, _ in session_keys],
         [api_key for _, api_key in session_keys],
+        *((status_filter,) if status_filter is not None else ()),
     )
     rep_by_key: Final[Mapping[tuple[str, str], dict[str, object]]] = MappingProxyType(  # mutable-ok: same rows
         {(str(row["session_id"] or row["request_id"]), str(row["api_key"])): row for row in rep_rows}
     )
     return [rep_by_key[key] for key in session_keys if key in rep_by_key]
-
-
-async def _count_grouped_sessions(
-    prisma_client: "PrismaClient",
-    where_clause: str,
-    sql_params: Sequence[object],
-    next_param_index: int,
-) -> tuple[int, bool]:
-    """Count the sessions matching the filter, returning ``(total, total_is_capped)`` bounded by the count cap."""
-    count_query: Final = f"""
-        SELECT COUNT(*) AS total_count
-        FROM (
-            SELECT 1
-            FROM "LiteLLM_SpendLogs"
-            WHERE {where_clause}
-            GROUP BY {_SESSION_GROUP_KEY_SQL}
-            LIMIT ${next_param_index}
-        ) AS bounded_sessions
-    """
-    count_rows: Final[Sequence[_SpendLogsCountRow]] = await _query_raw(
-        prisma_client, count_query, *sql_params, SPEND_LOGS_PAGINATION_COUNT_CAP + 1
-    )
-    raw_total: Final = int(count_rows[0]["total_count"]) if count_rows else 0
-    return (
-        (SPEND_LOGS_PAGINATION_COUNT_CAP, True) if raw_total > SPEND_LOGS_PAGINATION_COUNT_CAP else (raw_total, False)
-    )
 
 
 async def _ui_session_grouped_spend_logs(
@@ -3161,6 +3194,7 @@ async def _ui_session_grouped_spend_logs(
     page_size: int,
     sort_desc: bool,
     session_cursor: str | None,
+    status_filtered: bool = False,
 ) -> Mapping[str, object]:
     """
     One row per session, keyset-paginated by session last activity.
@@ -3186,12 +3220,19 @@ async def _ui_session_grouped_spend_logs(
     starts past the end says nothing about the total, so that one is counted.
     """
     where_clause: Final = " AND ".join(sql_conditions) if sql_conditions else "TRUE"
+    # The status filter keeps or drops whole sessions, so it holds for every row of a session already on the
+    # page; the probe and the representatives skip it rather than regroup the window once per session. The
+    # representatives re-check it on the page's own sessions, since a row written after the page read can change a
+    # session's outcome.
+    row_conditions: Final = sql_conditions[:-1] if status_filtered else sql_conditions
+    row_params: Final = sql_params[:-1] if status_filtered else sql_params
+    row_where_clause: Final = " AND ".join(row_conditions) if row_conditions else "TRUE"
     cmp_op: Final = "<" if sort_desc else ">"
     direction: Final = "DESC" if sort_desc else "ASC"
 
     cursor: Final = _parse_session_cursor(session_cursor)
-    having_clause: Final = (
-        f'HAVING (MAX("startTime"), {_SESSION_GROUP_KEY_SQL}) {cmp_op} '
+    cursor_clause: Final = (
+        f"WHERE (last_activity, session_key, api_key) {cmp_op} "
         f"(${next_param_index}::timestamp, ${next_param_index + 1}, ${next_param_index + 2})"
         if cursor
         else ""
@@ -3203,21 +3244,158 @@ async def _ui_session_grouped_spend_logs(
     offset_params: Final[tuple[int, ...]] = (offset,) if offset and page_limit > 0 else ()
     offset_clause: Final = f"OFFSET ${limit_index + 1}" if offset_params else ""
 
-    page_query: Final = f"""
-        SELECT {_SESSION_KEY_EXPR} AS session_key,
-               api_key,
-               MAX("startTime")::text AS last_activity
-        FROM "LiteLLM_SpendLogs"
-        WHERE {where_clause}
-        GROUP BY {_SESSION_GROUP_KEY_SQL}
-        {having_clause}
-        ORDER BY MAX("startTime") {direction}, {_SESSION_KEY_EXPR} {direction}, api_key {direction}
-        LIMIT ${limit_index} {offset_clause}
-    """
+    # Read only the newest matching rows, growing the read until it decides the page and the capped count:
+    # every row newer than the oldest one read is in the read, so a session whose last activity is newer
+    # than that row is complete in it. A descending page is exact once its (page_limit + 1)th session is,
+    # and the count once the read holds more sessions than the cap (or the read holds every matching row).
+    # A session after a descending cursor has no row newer than the cursor, so that read starts at the
+    # cursor; a session with a newer row ranks before the cursor, so it is dropped after the sort (only the
+    # page's candidates are probed). If the sessions after the cursor do not pass the cap, the window's
+    # count is read afterwards from the newest rows the same way, without the page.
+    cap: Final = int(SPEND_LOGS_PAGINATION_COUNT_CAP)
+    # offset + page_limit never passes the cap, so the read stays bounded however large the page number is.
+    first_read: Final = cap + offset + page_limit + 2
+    from_cursor: Final = cursor is not None and sort_desc
+    # A cursor page needs the session after it; any other page needs one session past the cap for its count.
+    sessions_needed: Final = page_limit + 1 if from_cursor else cap + 1
+    # An offset page's read that holds no session of the page hands its sessions to the next read, which then reads
+    # only the rows at or before that read's oldest row instead of reading the newest rows again.
+    carry_index: Final = limit_index + 1 + len(offset_params)
+    carried: Sequence[_SessionScanRow] = ()
+    carry_params: tuple[list[str], list[str], list[str], str] | tuple[()] = ()
+    found: Sequence[_SessionScanRow] = ()
+    session_count = 0
+    rows_read = 0
+    for growth in _SESSION_SCAN_GROWTH if sort_desc else (None,):
+        scan_rows: int | None = None if growth is None else first_read * growth
+        # Skip a read that the last read's rows per session say still holds too few sessions to decide anything.
+        if _read_falls_short(scan_rows, session_count, rows_read, sessions_needed):
+            continue
+        read_rows: int | None = None if scan_rows is None else scan_rows - rows_read if carried else scan_rows
+        not_after: str | None = (
+            f"${next_param_index}::timestamp" if from_cursor else f"${carry_index + 3}::timestamp" if carried else None
+        )
+        sessions_after: str = (
+            f"""(
+                    SELECT session_key, api_key, last_activity
+                    FROM sessions
+                    {cursor_clause}
+                    ORDER BY last_activity DESC, session_key DESC, api_key DESC
+                ) AS after_cursor
+                WHERE (
+                    SELECT 1 FROM "LiteLLM_SpendLogs"
+                    WHERE {row_where_clause}
+                      AND "startTime" > ${next_param_index}::timestamp
+                      AND (session_id = after_cursor.session_key OR request_id = after_cursor.session_key)
+                      AND {_SESSION_KEY_EXPR} = after_cursor.session_key
+                      AND api_key = after_cursor.api_key
+                    LIMIT 1
+                ) IS NULL"""
+            if from_cursor
+            else f"sessions {cursor_clause}"
+        )
+        carried_keys: str = f"${carry_index}::text[], ${carry_index + 1}::text[]"
+        page_query: str = f"""
+            WITH scanned AS MATERIALIZED (
+                {_newest_session_rows_sql(where_clause, read_rows, not_after)}
+            ),
+            sessions AS (
+                SELECT session_key, api_key, MAX("startTime") AS last_activity
+                FROM scanned
+                {f"WHERE (session_key, api_key) NOT IN (SELECT * FROM unnest({carried_keys}))" if carried else ""}
+                GROUP BY session_key, api_key
+                {f"UNION ALL SELECT * FROM unnest({carried_keys}, ${carry_index + 2}::timestamp[])" if carried else ""}
+            ),
+            edge AS (
+                SELECT COUNT(*) AS rows_scanned,
+                       MIN("startTime") AS oldest,
+                       (SELECT COUNT(*) FROM sessions) AS session_count
+                FROM scanned
+            )
+            SELECT page.session_key,
+                   page.api_key,
+                   page.last_activity::text AS last_activity,
+                   page.last_activity > edge.oldest AS settled,
+                   edge.rows_scanned,
+                   edge.session_count,
+                   edge.oldest::text AS oldest,
+                   page.carried
+            FROM edge
+            LEFT JOIN LATERAL (
+                (
+                    SELECT session_key, api_key, last_activity, FALSE AS carried
+                    FROM {sessions_after}
+                    ORDER BY last_activity {direction}, session_key {direction}, api_key {direction}
+                    LIMIT ${limit_index} {offset_clause}
+                )
+                {
+            f'''UNION ALL
+                SELECT session_key, api_key, last_activity, TRUE FROM sessions
+                WHERE edge.session_count <= ${limit_index + 1} AND edge.rows_scanned = {read_rows}'''
+            if offset_params and read_rows is not None
+            else ""
+        }
+            ) AS page ON TRUE
+        """
+        scan: Sequence[_SessionScanRow] = await _query_raw(
+            prisma_client,
+            page_query,
+            *sql_params,
+            *cursor_params,
+            max(page_limit + 1, 0),
+            *offset_params,
+            *carry_params,
+        )
+        found = [row for row in scan if row["session_key"] is not None]
+        session_count = int(scan[0]["session_count"])
+        read_everything: bool = read_rows is None or int(scan[0]["rows_scanned"]) < read_rows
+        rows_read = int(scan[0]["rows_scanned"]) + (rows_read if carried else 0)
+        carried = [row for row in scan if row.get("carried")]
+        carry_params = (
+            (
+                [str(row["session_key"]) for row in carried],
+                [str(row["api_key"]) for row in carried],
+                [str(row["last_activity"]) for row in carried],
+                str(scan[0]["oldest"]),
+            )
+            if carried
+            else ()
+        )
+        page_is_exact: bool = (
+            page_limit <= 0 or read_everything or (len(found) > page_limit and bool(found[-1]["settled"]))
+        )
+        if page_is_exact and (from_cursor or read_everything or session_count > cap):
+            break
+    if from_cursor and session_count <= cap:
+        # Skip to the first read that the last read's rows per session say holds more than the cap's sessions:
+        # each read is exact or discarded, so skipping a read changes how much is read, not the count.
+        for growth in _SESSION_SCAN_GROWTH:
+            count_rows: int | None = None if growth is None else first_read * growth
+            if _read_falls_short(count_rows, session_count, rows_read, cap + 1):
+                continue
+            count_query: str = f"""
+                WITH scanned AS MATERIALIZED ({_newest_session_rows_sql(where_clause, count_rows, None)})
+                SELECT COUNT(*) AS rows_scanned,
+                       (SELECT COUNT(*) FROM (SELECT 1 FROM scanned GROUP BY session_key, api_key) AS s)
+                       AS session_count
+                FROM scanned
+            """
+            counted: Sequence[Mapping[str, object]] = await _query_raw(prisma_client, count_query, *sql_params)
+            session_count = int(str(counted[0]["session_count"]))
+            rows_read = int(str(counted[0]["rows_scanned"]))
+            if count_rows is None or rows_read < count_rows or session_count > cap:
+                break
     page_rows: Final[Sequence[_SessionPageRow]] = (
         ()
         if page_limit <= 0
-        else await _query_raw(prisma_client, page_query, *sql_params, *cursor_params, page_limit + 1, *offset_params)
+        else [
+            {
+                "session_key": str(row["session_key"]),
+                "api_key": str(row["api_key"]),
+                "last_activity": str(row["last_activity"]),
+            }
+            for row in found
+        ]
     )
 
     has_more: Final = len(page_rows) > page_limit
@@ -3233,17 +3411,22 @@ async def _ui_session_grouped_spend_logs(
     total_records, total_is_capped = (
         (offset + len(page_rows), False)
         if page_ends_the_list
-        else await _count_grouped_sessions(prisma_client, where_clause, sql_params, next_param_index)
+        else (
+            (SPEND_LOGS_PAGINATION_COUNT_CAP, True)
+            if session_count > SPEND_LOGS_PAGINATION_COUNT_CAP
+            else (session_count, False)
+        )
     )
 
     session_keys: Final = tuple((row["session_key"], row["api_key"]) for row in visible_rows)
     data: Final[list[dict[str, object]]] = (  # mutable-ok: _build_ui_spend_logs_response writes onto each row
         await _fetch_session_representatives(
             prisma_client=prisma_client,
-            where_clause=where_clause,
-            sql_params=sql_params,
-            next_param_index=next_param_index,
+            where_clause=row_where_clause,
+            sql_params=row_params,
+            next_param_index=len(row_params) + 1,
             session_keys=session_keys,
+            status_filter=sql_params[-1] if status_filtered else None,
         )
         if session_keys
         else []
