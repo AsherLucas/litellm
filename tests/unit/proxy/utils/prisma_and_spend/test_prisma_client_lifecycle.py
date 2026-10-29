@@ -15,11 +15,56 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Final
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from litellm.proxy.utils import PrismaClient
+from litellm.repositories.database import Database
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_dead", (False, True))
+async def test_shutdown_waits_for_hung_request_reconnect_to_time_out(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch, engine_dead: bool
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+    reconnecting: Final = asyncio.Event()
+    cancelled: Final = asyncio.Event()
+
+    async def hung_recreate(*args: object, **kwargs: object) -> None:
+        reconnecting.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    prisma_client.db.recreate_prisma_client = AsyncMock(side_effect=hung_recreate)
+    prisma_client._engine_confirmed_dead = engine_dead
+    with patch.object(asyncio.get_running_loop(), "time", return_value=1000.0) as clock:
+        reconnect: Final = asyncio.create_task(
+            prisma_client.attempt_db_reconnect(reason="request", force=True, force_recreate=True)
+        )
+        await reconnecting.wait()
+        closing: Final = asyncio.create_task(Database(prisma=prisma_client).aclose())
+        try:
+            await asyncio.sleep(0)
+            assert not closing.done()
+            prisma_client.db.disconnect.assert_not_awaited()
+
+            clock.return_value = 1000.0 + prisma_client._db_watchdog_reconnect_timeout_seconds + 1
+            assert await reconnect is False
+            await closing
+        finally:
+            reconnect.cancel()
+            closing.cancel()
+            await asyncio.gather(reconnect, closing, return_exceptions=True)
+
+    assert cancelled.is_set()
+    assert not prisma_client._db_reconnect_lock.locked()
+    prisma_client.db.disconnect.assert_awaited_once()
+    assert await prisma_client.attempt_db_reconnect(reason="request", force=True) is False
+    prisma_client.db.recreate_prisma_client.assert_awaited_once()
 
 
 @pytest.mark.asyncio

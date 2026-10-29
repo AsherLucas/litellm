@@ -14,6 +14,7 @@ from tests.integration._support.database import read_rows, scratch_database
 
 pytestmark: Final = pytest.mark.timeout(180)
 ROOT: Final = Path(__file__).resolve().parents[3]
+PUBLICLY_KNOWN_KEY: Final = "sk-" + "1234"
 Mode: TypeAlias = Literal["late", "unsafe"]
 CONFIG: Final = (
     "model_list: []\n"
@@ -109,7 +110,7 @@ def test_failed_startup_then_retry_releases_database_resources(tmp_path: Path, m
             "DATABASE_URL": database_url,
             "DIRECT_URL": database_url,
             "CONFIG_FILE_PATH": str(config),
-            "LITELLM_MASTER_KEY": "sk-1234" if mode == "unsafe" else f"sk-{uuid.uuid4().hex}",
+            "LITELLM_MASTER_KEY": PUBLICLY_KNOWN_KEY if mode == "unsafe" else f"sk-{uuid.uuid4().hex}",
             "LITELLM_LOCAL_MODEL_COST_MAP": "True",
             "LITELLM_TELEMETRY_ENABLED": "false",
             "PRISMA_HEALTH_WATCHDOG_ENABLED": "true",

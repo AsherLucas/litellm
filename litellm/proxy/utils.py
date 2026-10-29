@@ -6656,6 +6656,9 @@ class PrismaClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Request-driven reconnects are not engine tasks. Wait for their bounded
+        # reconnect cycle to release the lock before disconnecting, otherwise a
+        # late reconnect can reopen the client after shutdown.
         async with self._db_reconnect_lock:
             pass
 
