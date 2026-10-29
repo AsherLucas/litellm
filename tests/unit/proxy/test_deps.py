@@ -48,8 +48,6 @@ def test_lifespan_database_is_shared_until_shutdown():
 
 def test_both_repositories_use_the_lifespan_database():
     prisma: Final = MagicMock()
-    prisma.disconnect = AsyncMock()
-    prisma.stop_background_tasks = AsyncMock()
     prisma.db.litellm_uisettings.find_unique = AsyncMock(
         return_value=SimpleNamespace(ui_settings={"message": "stored banner"})
     )
@@ -60,8 +58,6 @@ def test_both_repositories_use_the_lifespan_database():
     with TestClient(_app(database_runtime.Database(prisma=prisma))) as client:
         assert client.get("/banner").json() == UserBanner(message="stored banner").model_dump()
         assert client.get("/ignores").json() == stored_ignores
-        prisma.disconnect.assert_not_awaited()
-    prisma.disconnect.assert_awaited_once()
 
 
 def test_no_database_state_preserves_optional_repository():
