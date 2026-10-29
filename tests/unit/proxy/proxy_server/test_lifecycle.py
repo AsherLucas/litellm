@@ -24,6 +24,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -118,7 +119,7 @@ async def test_database_lifespan_disconnects_prisma_after_proxy_shutdown(monkeyp
     monkeypatch.setattr(litellm, "cache", None, raising=False)
     monkeypatch.setattr(litellm, "success_callback", [], raising=False)
 
-    async with database_runtime.lifespan(database_runtime.Database(prisma=fake_prisma)):
+    async with aclosing(database_runtime.Database(prisma=fake_prisma)):
         await proxy_shutdown_event()
         fake_prisma.disconnect.assert_not_awaited()
 
@@ -226,7 +227,7 @@ async def test_proxy_shutdown_drains_gateway_requests_before_disconnecting(monke
     monkeypatch.setattr(litellm, "cache", None, raising=False)
     monkeypatch.setattr(litellm, "success_callback", [], raising=False)
 
-    async with database_runtime.lifespan(database_runtime.Database(prisma=fake_prisma)):
+    async with aclosing(database_runtime.Database(prisma=fake_prisma)):
         await proxy_shutdown_event()
 
     assert calls == ["flush", "disconnect"]
@@ -268,7 +269,7 @@ async def test_proxy_shutdown_drains_audit_writes_beside_the_gateway_flush_befor
     monkeypatch.setattr(litellm, "success_callback", [], raising=False)
 
     track_audit_task(asyncio.create_task(_audit_write_that_finishes_after_the_flush_starts()))
-    async with database_runtime.lifespan(database_runtime.Database(prisma=fake_prisma)):
+    async with aclosing(database_runtime.Database(prisma=fake_prisma)):
         await asyncio.wait_for(proxy_shutdown_event(), timeout=2.0)
 
     assert calls == ["flush", "audit", "disconnect"]
@@ -341,7 +342,7 @@ async def test_database_lifespan_propagates_disconnect_error_after_shutdown(monk
     monkeypatch.setattr(litellm, "success_callback", [], raising=False)
 
     with pytest.raises(RuntimeError, match="db gone"):
-        async with database_runtime.lifespan(database_runtime.Database(prisma=fake_prisma)):
+        async with aclosing(database_runtime.Database(prisma=fake_prisma)):
             await proxy_shutdown_event()
 
 
@@ -1017,7 +1018,9 @@ async def test_proxy_shutdown_commits_spend_before_waiting_on_a_slow_logging_tas
 
     task_may_finish: Final = asyncio.Event()
     task_finished: Final = asyncio.Event()
-    flushes: Final[list[tuple[str, bool]]] = []  # mutable-ok: records what each shutdown flush saw, which is the assertion
+    flushes: Final[
+        list[tuple[str, bool]]
+    ] = []  # mutable-ok: records what each shutdown flush saw, which is the assertion
 
     async def slow_logging_task() -> None:
         await task_may_finish.wait()

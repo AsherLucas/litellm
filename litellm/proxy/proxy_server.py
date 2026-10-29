@@ -1429,9 +1429,17 @@ async def _connect_to_count_stored_values(resources: AsyncExitStack) -> Supports
         database_url=str(get_secret("DATABASE_URL")), proxy_logging_obj=proxy_logging_obj
     )
     if prisma_client is None:
-        await resources.enter_async_context(database_runtime.lifespan(database_runtime.Database(prisma=client)))
+        _own_database(resources, client)
     await client.connect()
     return client.writer_db
+
+
+def _own_database(resources: AsyncExitStack, client: PrismaClient | None) -> database_runtime.Database | None:
+    if client is None:
+        return None
+    database: Final = database_runtime.Database(prisma=client)
+    resources.push_async_callback(database.aclose)
+    return database
 
 
 def _forget_prisma_client() -> None:
@@ -1466,9 +1474,7 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
     import json
 
     resources.callback(_forget_prisma_client)
-    existing_database: Final = await resources.enter_async_context(
-        database_runtime.lifespan(None if prisma_client is None else database_runtime.Database(prisma=prisma_client))
-    )
+    existing_database: Final = _own_database(resources, prisma_client)
 
     init_verbose_loggers()
 
@@ -1578,9 +1584,7 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
             )
         )
 
-    database: Final = existing_database or await resources.enter_async_context(
-        database_runtime.lifespan(None if prisma_client is None else database_runtime.Database(prisma=prisma_client))
-    )
+    database: Final = existing_database or _own_database(resources, prisma_client)
 
     await migrate_if_requested(
         environ=os.environ,

@@ -23,15 +23,6 @@ class Database:
 
 
 @asynccontextmanager
-async def lifespan(database: Database | None) -> AsyncGenerator[Database | None, None]:
-    try:
-        yield database
-    finally:
-        if database is not None:
-            await database.aclose()
-
-
-@asynccontextmanager
 async def background_task(work: Coroutine[object, object, None]) -> AsyncGenerator[None, None]:
     task: Final = asyncio.create_task(work)
     try:
