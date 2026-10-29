@@ -20,7 +20,7 @@ metadata:
 
 ## Framework wiring
 
-- Python routes receive `RepositoriesDependency` and call domain operations such as `repositories.banners.get_banner()`
+- Python routes receive `RepositoriesDep` and call domain operations such as `repositories.banners.get_banner()`
 - Use named FastAPI providers with `Annotated[..., Depends(...)]`, ordinary helpers and jobs receive explicit arguments
 - Preserve each route's no-database behavior, authorization precedence and background-task scheduling
 - Read [Python and FastAPI](references/python-fastapi.md) for provider examples, lifespan state and route verification

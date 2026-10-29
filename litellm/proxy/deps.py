@@ -21,11 +21,11 @@ async def get_database(request: Request) -> Database | None:
     raise DatabaseStateMissingError()
 
 
-DatabaseDependency: TypeAlias = Annotated[Database | None, Depends(get_database)]
+DatabaseDep: TypeAlias = Annotated[Database | None, Depends(get_database)]
 
 
-async def get_repositories(database: DatabaseDependency) -> Repositories | None:
+async def get_repositories(database: DatabaseDep) -> Repositories | None:
     return None if database is None else Repositories(banners=UserBannerRepository(database.prisma))
 
 
-RepositoriesDependency: TypeAlias = Annotated[Repositories | None, Depends(get_repositories)]
+RepositoriesDep: TypeAlias = Annotated[Repositories | None, Depends(get_repositories)]

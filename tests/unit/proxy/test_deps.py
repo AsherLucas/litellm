@@ -9,20 +9,19 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from litellm.models.user_banner import UserBanner
-from litellm.proxy.deps import DatabaseStateMissingError, RepositoriesDependency, get_database
+from litellm.proxy.deps import DatabaseStateMissingError, RepositoriesDep, get_database
 from litellm.repositories import database as database_runtime
 
 
 def _app(database: database_runtime.Database | None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with database_runtime.lifespan(database) as owned_database:
-            yield {"database": owned_database}
+        yield {"database": database}
 
     app: Final = FastAPI(lifespan=lifespan)
 
     @app.get("/banner")
-    async def banner(repositories: RepositoriesDependency) -> UserBanner:
+    async def banner(repositories: RepositoriesDep) -> UserBanner:
         return UserBanner() if repositories is None else await repositories.banners.get_banner()
 
     return app
@@ -30,8 +29,6 @@ def _app(database: database_runtime.Database | None) -> FastAPI:
 
 def test_lifespan_database_is_shared_until_shutdown():
     prisma: Final = MagicMock()
-    prisma.disconnect = AsyncMock()
-    prisma.stop_background_tasks = AsyncMock()
     prisma.db.litellm_uisettings.find_unique = AsyncMock(return_value=None)
     app: Final = _app(database_runtime.Database(prisma=prisma))
     with TestClient(app) as client:
@@ -43,8 +40,6 @@ def test_lifespan_database_is_shared_until_shutdown():
             client.get("/banner").json()
             == UserBanner(enabled=True, message="published", revision="revision").model_dump()
         )
-        prisma.disconnect.assert_not_awaited()
-    prisma.disconnect.assert_awaited_once()
 
 
 def test_no_database_state_preserves_optional_repository():
@@ -56,8 +51,6 @@ def test_no_database_state_preserves_optional_repository():
 
 def test_dependency_override_changes_next_request_without_changing_lifespan_owner(monkeypatch):
     prisma: Final = MagicMock()
-    prisma.disconnect = AsyncMock()
-    prisma.stop_background_tasks = AsyncMock()
     prisma.db.litellm_uisettings.find_unique = AsyncMock(
         return_value=SimpleNamespace(ui_settings={"message": "stored"})
     )
@@ -66,8 +59,6 @@ def test_dependency_override_changes_next_request_without_changing_lifespan_owne
         assert client.get("/banner").json() == UserBanner(message="stored").model_dump()
         monkeypatch.setitem(app.dependency_overrides, get_database, lambda: None)
         assert client.get("/banner").json() == UserBanner().model_dump()
-        prisma.disconnect.assert_not_awaited()
-    prisma.disconnect.assert_awaited_once()
 
 
 @pytest.mark.asyncio

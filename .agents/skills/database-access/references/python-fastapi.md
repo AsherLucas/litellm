@@ -20,18 +20,18 @@ class Repositories:
     banners: UserBannerRepository
 
 
-async def get_repositories(database: DatabaseDependency) -> Repositories | None:
+async def get_repositories(database: DatabaseDep) -> Repositories | None:
     return None if database is None else Repositories(banners=UserBannerRepository(database.prisma))
 
 
-RepositoriesDependency: TypeAlias = Annotated[Repositories | None, Depends(get_repositories)]
+RepositoriesDep: TypeAlias = Annotated[Repositories | None, Depends(get_repositories)]
 ```
 
 - FastAPI supplies the container to routes and caches the provider within each request
 - Ordinary helpers and jobs receive explicit arguments, never unresolved `Depends` defaults
 
 ```python
-async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
+async def get_user_banner(repositories: RepositoriesDep) -> UserBanner:
     if repositories is None:
         return UserBanner()
     return await repositories.banners.get_banner()
@@ -41,11 +41,11 @@ async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
 
 - Prisma startup owns connection setup, authentication refresh, health checks and migrations
 - `Database` wraps the initialized Prisma client, without opening another pool or holding fields per feature
-- FastAPI lifespan enters `litellm.repositories.database.lifespan` and publishes its handle in request state
+- The proxy lifespan registers `Database.aclose` on its exit stack and publishes the handle in request state
 - Starlette shallow-copies lifespan state into request state, which is distinct from `app.state`
 - The database module never imports a repository, legacy globals borrow its handle without owning shutdown
 - Drain requests, jobs, logging, spend and audit work before database teardown
-- `litellm.repositories.database.lifespan` closes the handle on exit, including failures after entry
+- The exit stack closes the handle on exit, including startup failures after the client is created
 - When adding native resources, initialize them in the serving process, respecting runtime fork restrictions
 - Await native shutdown instead of depending on Python garbage collection
 - Apply the [connection ownership rules](../SKILL.md#connection-ownership) when changing the owner
@@ -81,7 +81,7 @@ async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
 - After the existing lifecycle owner initializes the native handle, update the provider
 
 ```diff
- async def get_repositories(database: DatabaseDependency) -> Repositories | None:
+ async def get_repositories(database: DatabaseDep) -> Repositories | None:
 -    return None if database is None else Repositories(banners=UserBannerRepository(database.prisma))
 +    if database is None:
 +        return None
@@ -131,5 +131,9 @@ async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
 
 ## Framework references
 
+- [Lifespan events](https://fastapi.tiangolo.com/advanced/events/) and [Starlette lifespan state](https://starlette.dev/lifespan/)
+- [`SessionDep`-style `Annotated` aliases](https://fastapi.tiangolo.com/tutorial/sql-databases/#create-a-session-dependency), which `DatabaseDep` and `RepositoriesDep` follow
 - [Dependency composition and caching](https://fastapi.tiangolo.com/tutorial/dependencies/sub-dependencies/)
+- [Background tasks and dependencies with `yield`](https://fastapi.tiangolo.com/advanced/advanced-dependencies/#background-tasks-and-dependencies-with-yield-technical-details)
 - [Dependency overrides](https://fastapi.tiangolo.com/advanced/testing-dependencies/)
+- [Testing lifespan](https://fastapi.tiangolo.com/advanced/testing-events/)

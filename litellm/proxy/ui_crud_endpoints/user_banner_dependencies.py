@@ -28,4 +28,4 @@ async def get_user_banner_audit() -> UserBannerAudit:
     return audit
 
 
-UserBannerAuditDependency: TypeAlias = Annotated[UserBannerAudit, Depends(get_user_banner_audit)]
+UserBannerAuditDep: TypeAlias = Annotated[UserBannerAudit, Depends(get_user_banner_audit)]

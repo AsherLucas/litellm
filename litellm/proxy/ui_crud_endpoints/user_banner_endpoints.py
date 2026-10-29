@@ -7,9 +7,9 @@ from litellm._uuid import uuid4
 from litellm.models.user_banner import UserBanner, UserBannerUpdate
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.deps import RepositoriesDependency
+from litellm.proxy.deps import RepositoriesDep
 from litellm.proxy.ui_crud_endpoints.user_banner_dependencies import (
-    UserBannerAuditDependency,
+    UserBannerAuditDep,
 )
 from litellm.types.llms.base import LiteLLMBaseModel
 
@@ -29,7 +29,7 @@ class UpdateUserBannerResponse(LiteLLMBaseModel):
     dependencies=[Depends(user_api_key_auth)],
     response_model=UserBanner,
 )
-async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
+async def get_user_banner(repositories: RepositoriesDep) -> UserBanner:
     """
     Get the admin-published dashboard banner.
     Readable by any authenticated user; rendered on every dashboard page.
@@ -48,8 +48,8 @@ async def get_user_banner(repositories: RepositoriesDependency) -> UserBanner:
 async def update_user_banner(
     banner_update: UserBannerUpdate,
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
-    repositories: RepositoriesDependency,
-    audit: UserBannerAuditDependency,
+    repositories: RepositoriesDep,
+    audit: UserBannerAuditDep,
     background_tasks: BackgroundTasks,
 ) -> UpdateUserBannerResponse:
     """
